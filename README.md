@@ -24,12 +24,14 @@ the grid angle.
 
 ## Run
 
+This project uses [pnpm](https://pnpm.io/).
+
 ```sh
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
-Then open the printed local URL.
+Then open the printed local URL. Other scripts: `pnpm build`, `pnpm preview`, `pnpm check`.
 
 ## Where things live
 
