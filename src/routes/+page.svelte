@@ -9,16 +9,24 @@
 		pointsString,
 		outlinePath
 	} from '$lib/hex.js';
-	import { buildShape, shapeSvgString, exportSvg, exportPng } from '$lib/export.js';
+	import { buildShape, exportSvg, exportPng } from '$lib/export.js';
 
 	const LIB_KEY = 'hexabounds:library';
+
+	/** @typedef {{ key: string, name: string, ids: string[], size: number, angle: number }} LibraryItem */
 
 	// --- settings ---
 	let size = $state(44); // hex radius in px
 	let angle = $state(0); // rotation of the whole grid, 0 = flat top/bottom
 
 	// --- selection ---
+	/** @type {SvelteSet<string>} */
 	const selected = new SvelteSet();
+	let painting = $state(false);
+	/** @type {'add' | 'erase'} */
+	let paintMode = $state('add');
+	/** @type {number | null} */
+	let paintPointerId = $state(null);
 
 	// --- viewport (the area the grid fills) ---
 	let stageW = $state(0);
@@ -32,6 +40,7 @@
 	);
 
 	// --- library ---
+	/** @type {LibraryItem[]} */
 	let library = $state([]);
 
 	onMount(() => {
@@ -47,9 +56,47 @@
 		if (browser) localStorage.setItem(LIB_KEY, JSON.stringify(library));
 	}
 
-	function toggle(id) {
-		if (selected.has(id)) selected.delete(id);
-		else selected.add(id);
+	/** @param {string} id */
+	function applyPaint(id) {
+		if (paintMode === 'add') selected.add(id);
+		else selected.delete(id);
+	}
+
+	/** @param {PointerEvent} event @param {string} id */
+	function startPainting(event, id) {
+		if (event.isPrimary === false) return;
+		if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+		event.preventDefault();
+		if (event.currentTarget instanceof Element) {
+			try {
+				event.currentTarget.releasePointerCapture(event.pointerId);
+			} catch {
+				// The pointer may not have been captured (e.g. mouse input).
+			}
+		}
+		painting = true;
+		paintPointerId = event.pointerId;
+		paintMode = selected.has(id) ? 'erase' : 'add';
+		applyPaint(id);
+	}
+
+	/** @param {PointerEvent} event */
+	function paintFromPointer(event) {
+		if (!painting || event.pointerId !== paintPointerId) return;
+
+		const target = document.elementFromPoint(event.clientX, event.clientY);
+		if (!(target instanceof Element)) return;
+
+		const hex = target.closest('.hex');
+		if (hex instanceof SVGElement && hex.dataset.id) applyPaint(hex.dataset.id);
+	}
+
+	/** @param {PointerEvent | undefined} event */
+	function stopPainting(event = undefined) {
+		if (event?.pointerId != null && paintPointerId != null && event.pointerId !== paintPointerId) return;
+		painting = false;
+		paintPointerId = null;
 	}
 
 	function clear() {
@@ -69,6 +116,7 @@
 		persist();
 	}
 
+	/** @param {LibraryItem} item */
 	function loadShape(item) {
 		selected.clear();
 		for (const id of item.ids) selected.add(id);
@@ -76,11 +124,13 @@
 		angle = item.angle;
 	}
 
+	/** @param {string} key */
 	function deleteShape(key) {
 		library = library.filter((i) => i.key !== key);
 		persist();
 	}
 
+	/** @param {LibraryItem} item @param {string} name */
 	function rename(item, name) {
 		item.name = name;
 		library = library;
@@ -88,17 +138,24 @@
 	}
 
 	// A small preview shape for a library item, rebuilt from its saved ids.
+	/** @param {LibraryItem} item */
 	function thumb(item) {
 		const hexes = buildHexesFromIds(item.ids, item.size);
 		return buildShape(hexes, computeOutlines(hexes), item.angle, 6);
 	}
 </script>
 
+<svelte:window
+	onpointermove={paintFromPointer}
+	onpointerup={stopPainting}
+	onpointercancel={stopPainting}
+/>
+
 <div class="app">
 	<aside class="panel">
 		<header>
 			<h1>hexabounds</h1>
-			<p class="hint">Click hexes to outline them. Touching hexes share one outline.</p>
+			<p class="hint">Click or drag across hexes to paint. Start on a selected hex to erase.</p>
 		</header>
 
 		<label class="control">
@@ -172,14 +229,16 @@
 
 	<main class="stage" bind:clientWidth={stageW} bind:clientHeight={stageH}>
 		{#if stageW && stageH}
-			<svg width={stageW} height={stageH} role="presentation">
+			<svg width={stageW} height={stageH} role="presentation" onpointerleave={stopPainting}>
 				<g transform="rotate({angle} {stageW / 2} {stageH / 2})">
 					{#each grid as hex (hex.id)}
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<polygon
 							class="hex"
 							class:selected={selected.has(hex.id)}
+							data-id={hex.id}
 							points={pointsString(hex.points)}
-							onclick={() => toggle(hex.id)}
+							onpointerdown={(e) => startPainting(e, hex.id)}
 						/>
 					{/each}
 
@@ -410,6 +469,8 @@
 
 	svg {
 		display: block;
+		touch-action: none;
+		user-select: none;
 	}
 
 	.hex {

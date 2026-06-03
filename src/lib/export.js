@@ -3,8 +3,16 @@
 // plus the merged green outline, rotated by the current angle and cropped to a
 // tight bounding box with a little padding.
 
+/**
+ * @typedef {[number, number]} Point
+ * @typedef {{points: Point[]}} HexLike
+ * @typedef {{width: number, height: number, polys: string[], paths: string[]}} Shape
+ */
+
+/** @param {number} n */
 const r2 = (n) => Math.round(n * 100) / 100;
 
+/** @param {Point} point @param {number} deg @returns {Point} */
 function rotate([x, y], deg) {
 	const a = (deg * Math.PI) / 180;
 	const c = Math.cos(a);
@@ -16,9 +24,11 @@ function rotate([x, y], deg) {
  * Produce renderable shape data: dimensions plus polygon/path geometry already
  * offset into a (0,0)-anchored box. Returns null when there's nothing selected.
  *
- * @param {Array<{points: Array<[number, number]>}>} hexes
- * @param {Array<Array<[number, number]>>} outlines
+ * @param {HexLike[]} hexes
+ * @param {Point[][]} outlines
  * @param {number} angle
+ * @param {number} [pad]
+ * @returns {Shape | null}
  */
 export function buildShape(hexes, outlines, angle, pad = 10) {
 	if (!hexes.length) return null;
@@ -41,6 +51,7 @@ export function buildShape(hexes, outlines, angle, pad = 10) {
 
 	const ox = pad - minX;
 	const oy = pad - minY;
+	/** @param {Point} point @returns {Point} */
 	const off = ([x, y]) => [r2(x + ox), r2(y + oy)];
 
 	const polys = hx.map((poly) => poly.map(off).map((p) => `${p[0]},${p[1]}`).join(' '));
@@ -57,7 +68,11 @@ export function buildShape(hexes, outlines, angle, pad = 10) {
 	};
 }
 
-/** Serialize shape data to a standalone SVG string. */
+/**
+ * Serialize shape data to a standalone SVG string.
+ * @param {Shape} shape
+ * @param {{background?: boolean}} [options]
+ */
 export function shapeSvgString(shape, { background = false } = {}) {
 	const bg = background ? `<rect width="${shape.width}" height="${shape.height}" fill="#ffffff"/>` : '';
 	const hexes = shape.polys
@@ -72,6 +87,7 @@ export function shapeSvgString(shape, { background = false } = {}) {
 	);
 }
 
+/** @param {string} href @param {string} filename */
 function download(href, filename) {
 	const a = document.createElement('a');
 	a.href = href;
@@ -81,6 +97,7 @@ function download(href, filename) {
 	a.remove();
 }
 
+/** @param {Shape | null} shape @param {string} [filename] */
 export function exportSvg(shape, filename = 'hexshape.svg') {
 	if (!shape) return;
 	const blob = new Blob([shapeSvgString(shape)], { type: 'image/svg+xml' });
@@ -89,8 +106,10 @@ export function exportSvg(shape, filename = 'hexshape.svg') {
 	URL.revokeObjectURL(url);
 }
 
+/** @param {Shape | null} shape @param {string} [filename] @param {number} [scale] */
 export function exportPng(shape, filename = 'hexshape.png', scale = 2) {
 	if (!shape) return Promise.resolve();
+	/** @type {Promise<void>} */
 	return new Promise((resolve, reject) => {
 		const blob = new Blob([shapeSvgString(shape, { background: true })], { type: 'image/svg+xml' });
 		const url = URL.createObjectURL(blob);
@@ -100,17 +119,29 @@ export function exportPng(shape, filename = 'hexshape.png', scale = 2) {
 			canvas.width = Math.ceil(shape.width * scale);
 			canvas.height = Math.ceil(shape.height * scale);
 			const ctx = canvas.getContext('2d');
+			if (!ctx) {
+				URL.revokeObjectURL(url);
+				reject(new Error('Could not create canvas context'));
+				return;
+			}
 			ctx.scale(scale, scale);
 			ctx.drawImage(img, 0, 0);
 			URL.revokeObjectURL(url);
 			canvas.toBlob((b) => {
+				if (!b) {
+					reject(new Error('Could not encode PNG'));
+					return;
+				}
 				const u = URL.createObjectURL(b);
 				download(u, filename);
 				URL.revokeObjectURL(u);
-				resolve();
+				resolve(undefined);
 			}, 'image/png');
 		};
-		img.onerror = reject;
+		img.onerror = () => {
+			URL.revokeObjectURL(url);
+			reject(new Error('Could not load generated SVG'));
+		};
 		img.src = url;
 	});
 }
