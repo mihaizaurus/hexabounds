@@ -42,6 +42,18 @@
 	// --- library ---
 	/** @type {LibraryItem[]} */
 	let library = $state([]);
+	/** @type {string | null} */
+	let renamingKey = $state(null);
+	let draftName = $state('');
+	/** @type {HTMLInputElement | null} */
+	let renameInput = $state(null);
+
+	$effect(() => {
+		if (renamingKey && renameInput) {
+			renameInput.focus();
+			renameInput.select();
+		}
+	});
 
 	onMount(() => {
 		try {
@@ -113,6 +125,8 @@
 			angle
 		};
 		library = [item, ...library];
+		renamingKey = item.key;
+		draftName = item.name;
 		persist();
 	}
 
@@ -127,14 +141,44 @@
 	/** @param {string} key */
 	function deleteShape(key) {
 		library = library.filter((i) => i.key !== key);
+		if (renamingKey === key) cancelRename();
 		persist();
+	}
+
+	/** @param {LibraryItem} item */
+	function beginRename(item) {
+		renamingKey = item.key;
+		draftName = item.name;
+	}
+
+	function cancelRename() {
+		renamingKey = null;
+		draftName = '';
 	}
 
 	/** @param {LibraryItem} item @param {string} name */
 	function rename(item, name) {
-		item.name = name;
-		library = library;
+		const nextName = name.trim() || item.name;
+		library = library.map((i) => (i.key === item.key ? { ...i, name: nextName } : i));
 		persist();
+	}
+
+	/** @param {LibraryItem} item */
+	function commitRename(item) {
+		if (renamingKey !== item.key) return;
+		rename(item, draftName);
+		cancelRename();
+	}
+
+	/** @param {KeyboardEvent} event @param {LibraryItem} item */
+	function handleRenameKeydown(event, item) {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			commitRename(item);
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			cancelRename();
+		}
 	}
 
 	// A small preview shape for a library item, rebuilt from its saved ids.
@@ -192,29 +236,52 @@
 				{#each library as item (item.key)}
 					{@const s = thumb(item)}
 					<div class="lib-item">
-						<button class="lib-load" title="Load this shape" onclick={() => loadShape(item)}>
-							<span class="preview">
-								{#if s}
-									<svg viewBox="0 0 {s.width} {s.height}" preserveAspectRatio="xMidYMid meet">
-										{#each s.polys as p}
-											<polygon points={p} fill="rgba(0,166,62,0.14)" />
-										{/each}
-										{#each s.paths as d}
-											<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
-										{/each}
-									</svg>
-								{/if}
-							</span>
-							<span class="meta">
-								<input
-									class="name"
-									value={item.name}
-									onclick={(e) => e.stopPropagation()}
-									onchange={(e) => rename(item, e.currentTarget.value)}
-								/>
-								<span class="sub">{item.ids.length} hexes · {item.size}px · {item.angle}°</span>
-							</span>
-						</button>
+						{#if renamingKey === item.key}
+							<div class="lib-load rename-form">
+								<span class="preview">
+									{#if s}
+										<svg viewBox="0 0 {s.width} {s.height}" preserveAspectRatio="xMidYMid meet">
+											{#each s.polys as p}
+												<polygon points={p} fill="rgba(0,166,62,0.14)" />
+											{/each}
+											{#each s.paths as d}
+												<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
+											{/each}
+										</svg>
+									{/if}
+								</span>
+								<span class="meta">
+									<input
+										class="name"
+										bind:value={draftName}
+										bind:this={renameInput}
+										onkeydown={(e) => handleRenameKeydown(e, item)}
+										onblur={() => commitRename(item)}
+									/>
+									<span class="sub">Enter saves · Esc cancels</span>
+								</span>
+							</div>
+						{:else}
+							<button class="lib-load" title="Load this shape" onclick={() => loadShape(item)}>
+								<span class="preview">
+									{#if s}
+										<svg viewBox="0 0 {s.width} {s.height}" preserveAspectRatio="xMidYMid meet">
+											{#each s.polys as p}
+												<polygon points={p} fill="rgba(0,166,62,0.14)" />
+											{/each}
+											{#each s.paths as d}
+												<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
+											{/each}
+										</svg>
+									{/if}
+								</span>
+								<span class="meta">
+									<span class="name name-display">{item.name}</span>
+									<span class="sub">{item.ids.length} hexes · {item.size}px · {item.angle}°</span>
+								</span>
+							</button>
+							<button class="rename" title="Rename" onclick={() => beginRename(item)}>✎</button>
+						{/if}
 						<button class="del" title="Delete" onclick={() => deleteShape(item.key)}>×</button>
 					</div>
 				{/each}
@@ -392,11 +459,17 @@
 
 	.lib-load {
 		flex: 1;
+		min-width: 0;
 		display: flex;
 		align-items: center;
 		gap: 10px;
 		padding: 6px;
 		text-align: left;
+	}
+
+	.rename-form {
+		border: 1px solid var(--green);
+		background: var(--white);
 	}
 
 	.preview {
@@ -440,12 +513,19 @@
 		color: var(--green);
 	}
 
+	.name-display {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
 	.sub {
 		font-size: 11px;
 		color: var(--black-soft);
 		font-variant-numeric: tabular-nums;
 	}
 
+	.rename,
 	.del {
 		padding: 0 10px;
 		font-size: 16px;
