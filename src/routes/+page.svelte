@@ -14,12 +14,27 @@
 
 	const LIB_KEY = 'hexabounds:library';
 
-	/** @typedef {{ key: string, name: string, ids: string[], positions?: {column: number, row: number}[], size: number, angle: number }} LibraryItem */
+	/** @typedef {{ key: string, name: string, ids: string[], positions?: {column: number, row: number}[], size: number, angle: number, folderId?: string | null, clusters?: { ids: string[], positions: {column: number, row: number}[] }[] }} LibraryItem */
+
+	const CLUSTER_FILLS = [
+		'rgba(0,166,62,0.18)',
+		'rgba(0,122,204,0.18)',
+		'rgba(220,110,0,0.18)',
+		'rgba(140,0,166,0.18)',
+		'rgba(0,166,140,0.18)',
+		'rgba(200,50,50,0.18)',
+	];
+	const CLUSTER_STROKES = ['#00a63e', '#007acc', '#dc6e00', '#8c00a6', '#00a68c', '#c83232'];
 
 	// --- settings ---
 	let size = $state(44);
 	let flatTop = $state(true);
 	const angle = $derived(flatTop ? 0 : 30);
+
+	// --- origin ---
+	const ORIGIN_KEY = 'hexabounds:origin';
+	let originCol = $state(0);
+	let originRow = $state(0);
 
 	// --- selection ---
 	/** @type {SvelteSet<string>} */
@@ -47,8 +62,48 @@
 	let stageH = $state(0);
 
 	const grid = $derived(generateGrid(stageW, stageH, size, flatTop));
-	const selectedHexes = $derived(grid.filter((h) => selected.has(h.id)));
-	const outlines = $derived(computeOutlines(selectedHexes));
+	const gridById = $derived(new Map(grid.map((h) => [h.id, h])));
+	// Iterate `selected` in insertion order so that clusters are numbered by when they were first painted.
+	const selectedHexes = $derived(
+		/** @type {ReturnType<typeof generateGrid>} */ ([...selected].map((id) => gridById.get(id)).filter((h) => h != null))
+	);
+
+	const selectionClusters = $derived.by(() => {
+		const hexById = new Map(selectedHexes.map((h) => [h.id, h]));
+		const visited = new Set();
+		/** @type {{ hexes: typeof selectedHexes, outlines: ReturnType<typeof computeOutlines> }[]} */
+		const result = [];
+		for (const hex of selectedHexes) {
+			if (!visited.has(hex.id)) {
+				const clusterHexes = [];
+				const queue = [hex];
+				visited.add(hex.id);
+				while (queue.length) {
+					const cur = /** @type {(typeof selectedHexes)[0]} */ (queue.shift());
+					clusterHexes.push(cur);
+					for (const nId of hexNeighborIds(cur.id, flatTop)) {
+						const neighbor = hexById.get(nId);
+						if (neighbor && !visited.has(nId)) {
+							visited.add(nId);
+							queue.push(neighbor);
+						}
+					}
+				}
+				result.push({ hexes: clusterHexes, outlines: computeOutlines(clusterHexes) });
+			}
+		}
+		return result;
+	});
+	const outlines = $derived(selectionClusters.flatMap((c) => c.outlines));
+	const clusterByHexId = $derived(
+		new Map(selectionClusters.flatMap((c, i) => c.hexes.map((h) => [h.id, i])))
+	);
+	const clusterCentroids = $derived(
+		selectionClusters.map((c) => ({
+			cx: c.hexes.reduce((s, h) => s + (h.cx ?? 0), 0) / c.hexes.length,
+			cy: c.hexes.reduce((s, h) => s + (h.cy ?? 0), 0) / c.hexes.length,
+		}))
+	);
 	const currentShape = $derived(
 		selectedHexes.length ? buildShape(selectedHexes, outlines, 0) : null
 	);
@@ -68,6 +123,26 @@
 	/** @type {HTMLInputElement | null} */
 	let renameInput = $state(null);
 
+	// --- folders ---
+	const FOLDERS_KEY = 'hexabounds:folders';
+	/** @typedef {{ key: string, name: string, collapsed: boolean }} Folder */
+	/** @type {Folder[]} */
+	let folders = $state([]);
+	/** @type {string | null} */
+	let renamingFolderKey = $state(null);
+	let draftFolderName = $state('');
+	/** @type {HTMLInputElement | null} */
+	let folderRenameInput = $state(null);
+
+	const ungroupedItems = $derived(library.filter((i) => !i.folderId));
+
+	// --- panel ---
+	let panelCollapsed = $state(false);
+	let panelWidth = $state(280);
+	let resizing = $state(false);
+	let resizeStartX = 0;
+	let resizeStartWidth = 0;
+
 	$effect(() => {
 		if (renamingKey && renameInput) {
 			renameInput.focus();
@@ -75,10 +150,114 @@
 		}
 	});
 
+	$effect(() => {
+		if (renamingFolderKey && folderRenameInput) {
+			folderRenameInput.focus();
+			folderRenameInput.select();
+		}
+	});
+
+	/** @param {PointerEvent} event */
+	function startResize(event) {
+		if (event.button !== 0) return;
+		if (event.currentTarget instanceof Element) {
+			event.currentTarget.setPointerCapture(event.pointerId);
+		}
+		resizing = true;
+		resizeStartX = event.clientX;
+		resizeStartWidth = panelWidth;
+		event.preventDefault();
+	}
+
+	/** @param {PointerEvent} event */
+	function handleResizeMove(event) {
+		if (!resizing) return;
+		panelWidth = Math.max(200, Math.min(600, resizeStartWidth + (event.clientX - resizeStartX)));
+	}
+
+	function stopResize() {
+		resizing = false;
+	}
+
+	function persistFolders() {
+		if (browser) localStorage.setItem(FOLDERS_KEY, JSON.stringify(folders));
+	}
+
+	function addFolder() {
+		const folder = { key: crypto.randomUUID(), name: `Folder ${folders.length + 1}`, collapsed: false };
+		folders = [...folders, folder];
+		renamingFolderKey = folder.key;
+		draftFolderName = folder.name;
+		persistFolders();
+	}
+
+	/** @param {string} key */
+	function deleteFolder(key) {
+		library = library.map((i) => (i.folderId === key ? { ...i, folderId: null } : i));
+		folders = folders.filter((f) => f.key !== key);
+		if (renamingFolderKey === key) { renamingFolderKey = null; draftFolderName = ''; }
+		persistFolders();
+		persist();
+	}
+
+	/** @param {string} key */
+	function toggleFolder(key) {
+		folders = folders.map((f) => (f.key === key ? { ...f, collapsed: !f.collapsed } : f));
+		persistFolders();
+	}
+
+	/** @param {Folder} folder */
+	function beginRenameFolder(folder) {
+		renamingFolderKey = folder.key;
+		draftFolderName = folder.name;
+	}
+
+	function cancelRenameFolder() {
+		renamingFolderKey = null;
+		draftFolderName = '';
+	}
+
+	/** @param {Folder} folder */
+	function commitRenameFolder(folder) {
+		if (renamingFolderKey !== folder.key) return;
+		const nextName = draftFolderName.trim() || folder.name;
+		folders = folders.map((f) => (f.key === folder.key ? { ...f, name: nextName } : f));
+		persistFolders();
+		cancelRenameFolder();
+	}
+
+	/** @param {KeyboardEvent} event @param {Folder} folder */
+	function handleFolderRenameKeydown(event, folder) {
+		if (event.key === 'Enter') { event.preventDefault(); commitRenameFolder(folder); }
+		else if (event.key === 'Escape') { event.preventDefault(); cancelRenameFolder(); }
+	}
+
+	/** @param {string} itemKey @param {string | null} folderId */
+	function moveItemToFolder(itemKey, folderId) {
+		library = library.map((i) => (i.key === itemKey ? { ...i, folderId: folderId || null } : i));
+		persist();
+	}
+
 	onMount(() => {
 		try {
 			const stored = localStorage.getItem(LIB_KEY);
 			if (stored) library = JSON.parse(stored);
+		} catch {
+			// ignore malformed storage
+		}
+		try {
+			const storedFolders = localStorage.getItem(FOLDERS_KEY);
+			if (storedFolders) folders = JSON.parse(storedFolders);
+		} catch {
+			// ignore malformed storage
+		}
+		try {
+			const storedOrigin = localStorage.getItem(ORIGIN_KEY);
+			if (storedOrigin) {
+				const parsed = JSON.parse(storedOrigin);
+				originCol = parsed.col ?? 0;
+				originRow = parsed.row ?? 0;
+			}
 		} catch {
 			// ignore malformed storage
 		}
@@ -103,11 +282,23 @@
 			.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column);
 	}
 
+	/** @param {{column: number, row: number}} p @returns {string} */
+	function fmtPos(p) {
+		return `{ column: ${p.column - originCol}, row: ${p.row - originRow} }`;
+	}
+
 	/** @param {LibraryItem} item @returns {string} */
 	function formatCoords(item) {
+		if (item.clusters && item.clusters.length > 1) {
+			const groups = item.clusters.map((cluster, i) => {
+				const inner = cluster.positions.map((p) => `      ${fmtPos(p)}`).join(',\n');
+				return `  // Group ${i + 1}\n  [\n${inner},\n  ]`;
+			});
+			return `[\n${groups.join(',\n')},\n]`;
+		}
 		const positions = getPositions(item);
 		if (!positions.length) return '[]';
-		const inner = positions.map((p) => `    { column: ${p.column}, row: ${p.row} }`).join(',\n');
+		const inner = positions.map((p) => `    ${fmtPos(p)}`).join(',\n');
 		return `[\n${inner},\n]`;
 	}
 
@@ -154,6 +345,16 @@
 		if (spaceHeld) return; // let event bubble up so SVG can handle panning
 		if (event.isPrimary === false) return;
 		if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+		// Ctrl+click: move the coordinate origin to this hex
+		if (event.ctrlKey) {
+			event.preventDefault();
+			const [c, r] = id.split(',').map(Number);
+			originCol = c;
+			originRow = r;
+			if (browser) localStorage.setItem(ORIGIN_KEY, JSON.stringify({ col: c, row: r }));
+			return;
+		}
 
 		// Alt+click on a selected hex deletes its entire connected cluster
 		if (event.altKey && selected.has(id)) {
@@ -253,13 +454,20 @@
 		const positions = ids
 			.map((id) => { const [c, r] = id.split(',').map(Number); return { column: c, row: r }; })
 			.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column);
+		const clusterData = selectionClusters.map((cluster) => ({
+			ids: cluster.hexes.map((h) => h.id),
+			positions: cluster.hexes
+				.map((h) => { const [c, r] = h.id.split(',').map(Number); return { column: c, row: r }; })
+				.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column)
+		}));
 		const item = {
 			key: crypto.randomUUID(),
 			name: `Shape ${library.length + 1}`,
 			ids,
 			positions,
 			size,
-			angle
+			angle,
+			clusters: clusterData.length > 1 ? clusterData : undefined
 		};
 		library = [item, ...library];
 		renamingKey = item.key;
@@ -318,10 +526,51 @@
 		}
 	}
 
+	const _r2 = (/** @type {number} */ n) => Math.round(n * 100) / 100;
+
 	/** @param {LibraryItem} item */
-	function thumb(item) {
-		const hexes = buildHexesFromIds(item.ids, item.size, item.angle !== 30);
-		return buildShape(hexes, computeOutlines(hexes), 0, 6);
+	function thumbForItem(item) {
+		const allHexes = buildHexesFromIds(item.ids, item.size, item.angle !== 30);
+		const combined = buildShape(allHexes, computeOutlines(allHexes), 0, 6);
+		if (!combined || !item.clusters || item.clusters.length <= 1) {
+			return { combined, clusterShapes: null };
+		}
+		// Reconstruct the offset buildShape applied (pad=6, angle=0 → no rotation)
+		let minX = Infinity, minY = Infinity;
+		for (const h of allHexes) {
+			for (const [x, y] of h.points) {
+				if (x < minX) minX = x;
+				if (y < minY) minY = y;
+			}
+		}
+		const ox = 6 - minX;
+		const oy = 6 - minY;
+		const idToIdx = new Map(item.ids.map((id, i) => [id, i]));
+		// Font size scaled so it renders ~11px in the 44px thumbnail regardless of viewBox size.
+		// With xMidYMid meet, scale = min(44/w, 44/h), so font_svg = 11 / scale = 11 * max(w,h) / 44.
+		const fontSize = _r2(Math.max(combined.width, combined.height) * 0.28);
+		const clusterShapes = item.clusters.map((cluster, ci) => {
+			const polys = cluster.ids
+				.map((id) => combined.polys[/** @type {number} */ (idToIdx.get(id))])
+				.filter(Boolean);
+			const clusterHexes = buildHexesFromIds(cluster.ids, item.size, item.angle !== 30);
+			const paths = computeOutlines(clusterHexes).map((loop) => {
+				const pts = loop.map(([x, y]) => `${_r2(x + ox)} ${_r2(y + oy)}`);
+				return 'M ' + pts.join(' L ') + ' Z';
+			});
+			let sumX = 0, sumY = 0, count = 0;
+			for (const h of clusterHexes) {
+				for (const [x, y] of h.points) { sumX += x + ox; sumY += y + oy; count++; }
+			}
+			const rawCx = sumX / count;
+			const rawCy = sumY / count;
+			// Clamp centroid so the label stays within the viewBox.
+			const half = fontSize * 0.6;
+			const cx = _r2(Math.max(half, Math.min(combined.width - half, rawCx)));
+			const cy = _r2(Math.max(half, Math.min(combined.height - half, rawCy)));
+			return { polys, paths, colorIdx: ci, cx, cy };
+		});
+		return { combined, clusterShapes, fontSize };
 	}
 </script>
 
@@ -334,15 +583,31 @@
 />
 
 <div class="app">
-	<aside class="panel">
-		<header>
-			<h1>hexabounds</h1>
-			<p class="hint">
-				Click or drag to paint. Start on a selected hex to erase.
-				<kbd>Alt</kbd>+click a selected hex to remove its connected cluster.
-				Hold <kbd>Space</kbd> and drag to pan.
-			</p>
-		</header>
+	<aside class="panel" class:collapsed={panelCollapsed} style={panelCollapsed ? '' : `width: ${panelWidth}px`}>
+		{#if !panelCollapsed}
+		<div
+			class="resize-handle"
+			onpointerdown={startResize}
+			onpointermove={handleResizeMove}
+			onpointerup={stopResize}
+			onpointercancel={stopResize}
+		></div>
+		{/if}
+		<div class="panel-top">
+			{#if !panelCollapsed}<h1>hexabounds</h1>{/if}
+			<button
+				class="collapse-btn"
+				title={panelCollapsed ? 'Expand panel' : 'Collapse panel'}
+				onclick={() => (panelCollapsed = !panelCollapsed)}
+			>{panelCollapsed ? '›' : '‹'}</button>
+		</div>
+		{#if !panelCollapsed}
+		<p class="hint">
+			Click or drag to paint. Start on a selected hex to erase.
+			<kbd>Alt</kbd>+click a selected hex to remove its connected cluster.
+			<kbd>Ctrl</kbd>+click any hex to set the coordinate origin.
+			Hold <kbd>Space</kbd> and drag to pan.
+		</p>
 
 		<label class="control">
 			<span class="control-label">
@@ -380,86 +645,169 @@
 		<div class="library">
 			<div class="lib-head">
 				<span class="section">Library</span>
-				<button class="save" onclick={saveShape} disabled={!selected.size}>Save shape</button>
+				<div class="lib-head-actions">
+					<button class="new-folder" onclick={addFolder} title="New folder">+ Folder</button>
+					<button class="save" onclick={saveShape} disabled={!selected.size}>Save shape</button>
+				</div>
 			</div>
 
+			{#snippet libEntry(item)}
+				{@const tc = thumbForItem(item)}
+				<div class="lib-entry">
+					<div class="lib-item">
+						{#if renamingKey === item.key}
+							<div class="lib-load rename-form">
+								<span class="preview">
+									{#if tc.combined}
+										<svg viewBox="0 0 {tc.combined.width} {tc.combined.height}" preserveAspectRatio="xMidYMid meet">
+											{#if tc.clusterShapes}
+												{#each tc.clusterShapes as cs (cs.colorIdx)}
+													{#each cs.polys as p}
+														<polygon points={p} fill={CLUSTER_FILLS[cs.colorIdx % CLUSTER_FILLS.length]} />
+													{/each}
+													{#each cs.paths as d}
+														<path {d} fill="none" stroke={CLUSTER_STROKES[cs.colorIdx % CLUSTER_STROKES.length]} stroke-width="3" stroke-linejoin="round" />
+													{/each}
+												{/each}
+											{#each tc.clusterShapes as cs (cs.colorIdx)}
+												<text x={cs.cx} y={cs.cy} text-anchor="middle" dominant-baseline="middle" font-size={tc.fontSize} font-weight="bold" paint-order="stroke" stroke="white" stroke-width={tc.fontSize * 0.18} fill={CLUSTER_STROKES[cs.colorIdx % CLUSTER_STROKES.length]}>{cs.colorIdx + 1}</text>
+											{/each}
+											{:else}
+												{#each tc.combined.polys as p}
+													<polygon points={p} fill="rgba(0,166,62,0.14)" />
+												{/each}
+												{#each tc.combined.paths as d}
+													<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
+												{/each}
+											{/if}
+										</svg>
+									{/if}
+								</span>
+								<span class="meta">
+									<input
+										class="name"
+										bind:value={draftName}
+										bind:this={renameInput}
+										onkeydown={(e) => handleRenameKeydown(e, item)}
+										onblur={() => commitRename(item)}
+									/>
+									<span class="sub">Enter saves · Esc cancels</span>
+								</span>
+							</div>
+						{:else}
+							<button class="lib-load" title="Load this shape" onclick={() => loadShape(item)}>
+								<span class="preview">
+									{#if tc.combined}
+										<svg viewBox="0 0 {tc.combined.width} {tc.combined.height}" preserveAspectRatio="xMidYMid meet">
+											{#if tc.clusterShapes}
+												{#each tc.clusterShapes as cs (cs.colorIdx)}
+													{#each cs.polys as p}
+														<polygon points={p} fill={CLUSTER_FILLS[cs.colorIdx % CLUSTER_FILLS.length]} />
+													{/each}
+													{#each cs.paths as d}
+														<path {d} fill="none" stroke={CLUSTER_STROKES[cs.colorIdx % CLUSTER_STROKES.length]} stroke-width="3" stroke-linejoin="round" />
+													{/each}
+												{/each}
+											{#each tc.clusterShapes as cs (cs.colorIdx)}
+												<text x={cs.cx} y={cs.cy} text-anchor="middle" dominant-baseline="middle" font-size={tc.fontSize} font-weight="bold" paint-order="stroke" stroke="white" stroke-width={tc.fontSize * 0.18} fill={CLUSTER_STROKES[cs.colorIdx % CLUSTER_STROKES.length]}>{cs.colorIdx + 1}</text>
+											{/each}
+											{:else}
+												{#each tc.combined.polys as p}
+													<polygon points={p} fill="rgba(0,166,62,0.14)" />
+												{/each}
+												{#each tc.combined.paths as d}
+													<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
+												{/each}
+											{/if}
+										</svg>
+									{/if}
+								</span>
+								<span class="meta">
+									<span class="name name-display">{item.name}</span>
+									<span class="sub"
+										>{item.ids.length} hexes · {item.size}px · {item.angle !== 30
+											? 'flat-top'
+											: 'flat-sides'}</span
+									>
+								</span>
+							</button>
+							<div class="lib-actions">
+								<button class="rename" title="Rename" onclick={() => beginRename(item)}>Rename</button>
+								<button
+									class="coords-toggle"
+									class:active={expandedKey === item.key}
+									title="Show coordinates"
+									onclick={() => (expandedKey = expandedKey === item.key ? null : item.key)}
+								>Coords</button>
+								<button class="del" title="Delete" onclick={() => deleteShape(item.key)}>Delete</button>
+							</div>
+							{#if folders.length > 0}
+							<div class="lib-folder-row">
+								<span class="folder-label">Folder</span>
+								<select
+									class="folder-select"
+									value={item.folderId ?? ''}
+									onchange={(e) => moveItemToFolder(item.key, e.currentTarget.value || null)}
+								>
+									<option value="">—</option>
+									{#each folders as f (f.key)}
+										<option value={f.key}>{f.name}</option>
+									{/each}
+								</select>
+							</div>
+							{/if}
+						{/if}
+					</div>
+					{#if expandedKey === item.key}
+						<div class="coords-panel">
+							<pre class="coords-text">{formatCoords(item)}</pre>
+							<button
+								class="copy-btn"
+								onclick={() => copyCoords(item)}
+							>{copiedKey === item.key ? 'Copied!' : 'Copy'}</button>
+						</div>
+					{/if}
+				</div>
+			{/snippet}
+
 			<div class="lib-list">
-				{#if library.length === 0}
+				{#if library.length === 0 && folders.length === 0}
 					<p class="empty">Select hexes and save a shape to build your library.</p>
 				{/if}
-				{#each library as item (item.key)}
-					{@const s = thumb(item)}
-					<div class="lib-entry">
-						<div class="lib-item">
-							{#if renamingKey === item.key}
-								<div class="lib-load rename-form">
-									<span class="preview">
-										{#if s}
-											<svg viewBox="0 0 {s.width} {s.height}" preserveAspectRatio="xMidYMid meet">
-												{#each s.polys as p}
-													<polygon points={p} fill="rgba(0,166,62,0.14)" />
-												{/each}
-												{#each s.paths as d}
-													<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
-												{/each}
-											</svg>
-										{/if}
-									</span>
-									<span class="meta">
-										<input
-											class="name"
-											bind:value={draftName}
-											bind:this={renameInput}
-											onkeydown={(e) => handleRenameKeydown(e, item)}
-											onblur={() => commitRename(item)}
-										/>
-										<span class="sub">Enter saves · Esc cancels</span>
-									</span>
-								</div>
+				{#each folders as folder (folder.key)}
+					<div class="folder">
+						<div class="folder-header">
+							<button class="folder-toggle" onclick={() => toggleFolder(folder.key)}>
+								{folder.collapsed ? '▶' : '▼'}
+							</button>
+							{#if renamingFolderKey === folder.key}
+								<input
+									class="folder-name-input"
+									bind:value={draftFolderName}
+									bind:this={folderRenameInput}
+									onkeydown={(e) => handleFolderRenameKeydown(e, folder)}
+									onblur={() => commitRenameFolder(folder)}
+								/>
 							{:else}
-								<button class="lib-load" title="Load this shape" onclick={() => loadShape(item)}>
-									<span class="preview">
-										{#if s}
-											<svg viewBox="0 0 {s.width} {s.height}" preserveAspectRatio="xMidYMid meet">
-												{#each s.polys as p}
-													<polygon points={p} fill="rgba(0,166,62,0.14)" />
-												{/each}
-												{#each s.paths as d}
-													<path {d} fill="none" stroke="#00a63e" stroke-width="3" stroke-linejoin="round" />
-												{/each}
-											</svg>
-										{/if}
-									</span>
-									<span class="meta">
-										<span class="name name-display">{item.name}</span>
-										<span class="sub"
-											>{item.ids.length} hexes · {item.size}px · {item.angle !== 30
-												? 'flat-top'
-												: 'flat-sides'}</span
-										>
-									</span>
-								</button>
-								<button class="rename" title="Rename" onclick={() => beginRename(item)}>✎</button>
+								<span class="folder-name">{folder.name} <span class="folder-count">({library.filter((i) => i.folderId === folder.key).length})</span></span>
 							{/if}
-							<button
-								class="coords-toggle"
-								class:active={expandedKey === item.key}
-								title="Show coordinates"
-								onclick={() => (expandedKey = expandedKey === item.key ? null : item.key)}
-								>{'{ }'}</button
-							>
-							<button class="del" title="Delete" onclick={() => deleteShape(item.key)}>×</button>
+							<button class="folder-btn" title="Rename folder" onclick={() => beginRenameFolder(folder)}>✎</button>
+							<button class="folder-btn del" title="Delete folder" onclick={() => deleteFolder(folder.key)}>×</button>
 						</div>
-						{#if expandedKey === item.key}
-							<div class="coords-panel">
-								<pre class="coords-text">{formatCoords(item)}</pre>
-								<button
-									class="copy-btn"
-									onclick={() => copyCoords(item)}
-								>{copiedKey === item.key ? 'Copied!' : 'Copy'}</button>
+						{#if !folder.collapsed}
+							<div class="folder-items">
+								{#each library.filter((i) => i.folderId === folder.key) as item (item.key)}
+									{@render libEntry(item)}
+								{/each}
+								{#if library.filter((i) => i.folderId === folder.key).length === 0}
+									<p class="empty-folder">Empty — use the Folder selector on a shape to add it here.</p>
+								{/if}
 							</div>
 						{/if}
 					</div>
+				{/each}
+				{#each ungroupedItems as item (item.key)}
+					{@render libEntry(item)}
 				{/each}
 			</div>
 		</div>
@@ -477,6 +825,7 @@
 				<button onclick={clear} disabled={selected.size === 0}>Clear</button>
 			</div>
 		</div>
+		{/if}
 	</aside>
 
 	<main class="stage" bind:clientWidth={stageW} bind:clientHeight={stageH}>
@@ -492,20 +841,41 @@
 			>
 				<g transform="translate({panX} {panY})">
 					{#each grid as hex (hex.id)}
+						{@const ci = selected.has(hex.id) ? (clusterByHexId.get(hex.id) ?? 0) : null}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<polygon
 							class="hex"
 							class:selected={selected.has(hex.id)}
-							class:origin={hex.id === '0,0'}
+							class:origin={hex.id === `${originCol},${originRow}`}
 							data-id={hex.id}
 							points={pointsString(hex.points)}
+							style={ci != null ? `fill:${CLUSTER_FILLS[ci % CLUSTER_FILLS.length]}` : ''}
 							onpointerdown={(e) => startPainting(e, hex.id)}
 						/>
 					{/each}
 
-					{#each outlines as loop, i (i)}
-						<path class="outline" d={outlinePath(loop)} />
+					{#each selectionClusters as cluster, ci (ci)}
+						{#each cluster.outlines as loop, li (li)}
+							<path class="outline" d={outlinePath(loop)} style="stroke:{CLUSTER_STROKES[ci % CLUSTER_STROKES.length]}" />
+						{/each}
 					{/each}
+
+					{#if selectionClusters.length > 1}
+						{#each clusterCentroids as centroid, ci (ci)}
+							<text
+								x={centroid.cx}
+								y={centroid.cy}
+								text-anchor="middle"
+								dominant-baseline="middle"
+								font-size={size * 0.65}
+								font-weight="bold"
+								paint-order="stroke"
+								stroke="white"
+								stroke-width={size * 0.12}
+								fill={CLUSTER_STROKES[ci % CLUSTER_STROKES.length]}
+							>{ci + 1}</text>
+						{/each}
+					{/if}
 				</g>
 			</svg>
 		{/if}
@@ -521,7 +891,6 @@
 	}
 
 	.panel {
-		width: var(--panel-width);
 		flex-shrink: 0;
 		padding: 24px;
 		border-right: 1px solid var(--black-faint);
@@ -530,12 +899,52 @@
 		gap: 20px;
 		background: var(--white);
 		z-index: 1;
+		position: relative;
+		overflow: hidden;
 	}
 
-	header {
+	.panel.collapsed {
+		width: 48px;
+		padding: 12px 8px;
+		gap: 0;
+		align-items: center;
+	}
+
+	.panel-top {
 		display: flex;
-		flex-direction: column;
-		gap: 10px;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		flex-shrink: 0;
+	}
+
+	.panel.collapsed .panel-top {
+		justify-content: center;
+	}
+
+	.collapse-btn {
+		width: 24px;
+		height: 24px;
+		padding: 0;
+		font-size: 16px;
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.resize-handle {
+		position: absolute;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		width: 5px;
+		cursor: col-resize;
+		z-index: 10;
+	}
+
+	.resize-handle:hover {
+		background: var(--green-wash);
 	}
 
 	h1 {
@@ -680,6 +1089,15 @@
 		justify-content: space-between;
 	}
 
+	.lib-head-actions {
+		display: flex;
+		gap: 6px;
+	}
+
+	.new-folder {
+		padding: 5px 10px;
+	}
+
 	.section {
 		font-size: 13px;
 		font-weight: 600;
@@ -707,18 +1125,36 @@
 
 	.lib-item {
 		display: flex;
-		align-items: stretch;
-		gap: 6px;
+		flex-direction: column;
+		border: 1px solid var(--black-faint);
 	}
 
 	.lib-load {
-		flex: 1;
-		min-width: 0;
+		width: 100%;
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		padding: 6px;
+		padding: 8px;
 		text-align: left;
+		border: none;
+	}
+
+	.lib-actions {
+		display: flex;
+		border-top: 1px solid var(--black-faint);
+	}
+
+	.lib-actions button {
+		flex: 1;
+		padding: 5px 6px;
+		font-size: 12px;
+		border: none;
+		border-right: 1px solid var(--black-faint);
+		border-radius: 0;
+	}
+
+	.lib-actions button:last-child {
+		border-right: none;
 	}
 
 	.rename-form {
@@ -779,21 +1215,123 @@
 		font-variant-numeric: tabular-nums;
 	}
 
-	.rename,
-	.del,
-	.coords-toggle {
-		padding: 0 10px;
-		font-size: 16px;
-		line-height: 1;
-	}
-
-	.coords-toggle {
-		font-size: 11px;
-		letter-spacing: -0.05em;
-	}
-
 	.coords-toggle.active {
-		border-color: var(--green);
+		color: var(--green);
+	}
+
+	/* --- folders --- */
+	.folder {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.folder-header {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 4px 2px;
+		border-bottom: 1px solid var(--black-faint);
+	}
+
+	.folder-toggle {
+		padding: 2px 6px;
+		font-size: 10px;
+		border: none;
+		flex-shrink: 0;
+	}
+
+	.folder-toggle:not(:disabled):hover {
+		border-color: transparent;
+		background: var(--green-wash);
+		color: var(--black);
+	}
+
+	.folder-name {
+		flex: 1;
+		font-size: 13px;
+		font-weight: 500;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.folder-count {
+		font-size: 11px;
+		font-weight: 400;
+		color: var(--black-soft);
+	}
+
+	.folder-name-input {
+		flex: 1;
+		font: inherit;
+		font-size: 13px;
+		font-weight: 500;
+		border: none;
+		border-bottom: 1px solid var(--green);
+		background: transparent;
+		padding: 0;
+		min-width: 0;
+		color: var(--green);
+	}
+
+	.folder-name-input:focus {
+		outline: none;
+	}
+
+	.folder-btn {
+		padding: 2px 6px;
+		font-size: 14px;
+		border: none;
+		flex-shrink: 0;
+	}
+
+	.folder-btn.del {
+		font-size: 16px;
+	}
+
+	.folder-items {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 6px 0 6px 12px;
+	}
+
+	.empty-folder {
+		margin: 0;
+		font-size: 11px;
+		color: var(--black-soft);
+		line-height: 1.5;
+	}
+
+	.lib-folder-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 3px 8px;
+		border-top: 1px solid var(--black-faint);
+	}
+
+	.folder-label {
+		font-size: 11px;
+		color: var(--black-soft);
+		flex-shrink: 0;
+	}
+
+	.folder-select {
+		font: inherit;
+		font-size: 11px;
+		flex: 1;
+		border: none;
+		background: transparent;
+		color: var(--black);
+		padding: 1px 0;
+		cursor: pointer;
+		min-width: 0;
+	}
+
+	.folder-select:focus {
+		outline: none;
 		color: var(--green);
 	}
 
