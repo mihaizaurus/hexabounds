@@ -14,7 +14,7 @@
 
 	const LIB_KEY = 'hexabounds:library';
 
-	/** @typedef {{ key: string, name: string, ids: string[], positions?: {column: number, row: number}[], size: number, angle: number, folderId?: string | null, clusters?: { ids: string[], positions: {column: number, row: number}[] }[] }} LibraryItem */
+	/** @typedef {{ key: string, name: string, ids: string[], positions?: {q: number, r: number}[], size: number, angle: number, folderId?: string | null, clusters?: { ids: string[], positions: {q: number, r: number}[] }[] }} LibraryItem */
 
 	const CLUSTER_FILLS = [
 		'rgba(0,166,62,0.18)',
@@ -31,10 +31,10 @@
 	let flatTop = $state(true);
 	const angle = $derived(flatTop ? 0 : 30);
 
-	// --- origin ---
+	// --- origin (axial coordinates) ---
 	const ORIGIN_KEY = 'hexabounds:origin';
-	let originCol = $state(0);
-	let originRow = $state(0);
+	let originQ = $state(0);
+	let originR = $state(0);
 
 	// --- selection ---
 	/** @type {SvelteSet<string>} */
@@ -64,8 +64,8 @@
 	let moveStartHexId = null;
 	/** @type {string[]} */
 	let moveStartIds = [];
-	/** @type {{ dc: number, dr: number }} */
-	let moveDelta = $state({ dc: 0, dr: 0 });
+	/** @type {{ dq: number, dr: number }} */
+	let moveDelta = $state({ dq: 0, dr: 0 });
 	/** @type {number | null} */
 	let movePointerId = null;
 
@@ -77,18 +77,14 @@
 	const originPanTarget = $derived.by(() => {
 		const SQRT3 = Math.sqrt(3);
 		if (flatTop) {
-			const colStep = 3 * size;
-			const rowStep = (SQRT3 * size) / 2;
 			return {
-				x: -(originCol * colStep + (Math.abs(originRow % 2) === 1 ? colStep / 2 : 0)),
-				y: -(originRow * rowStep),
+				x: -(size * (3 / 2) * originQ),
+				y: -(size * (SQRT3 / 2 * originQ + SQRT3 * originR)),
 			};
 		} else {
-			const colStep = (SQRT3 * size) / 2;
-			const rowStep = 3 * size;
 			return {
-				x: -(originCol * colStep),
-				y: -(originRow * rowStep + (Math.abs(originCol % 2) === 1 ? rowStep / 2 : 0)),
+				x: -(size * (SQRT3 * originQ + SQRT3 / 2 * originR)),
+				y: -(size * (3 / 2) * originR),
 			};
 		}
 	});
@@ -113,7 +109,7 @@
 				while (queue.length) {
 					const cur = /** @type {(typeof selectedHexes)[0]} */ (queue.shift());
 					clusterHexes.push(cur);
-					for (const nId of hexNeighborIds(cur.id, flatTop)) {
+					for (const nId of hexNeighborIds(cur.id)) {
 						const neighbor = hexById.get(nId);
 						if (neighbor && !visited.has(nId)) {
 							visited.add(nId);
@@ -141,10 +137,12 @@
 	);
 
 	const ghostIds = $derived.by(() => {
-		if (!moveActive || (moveDelta.dc === 0 && moveDelta.dr === 0) || !moveStartHexId) return null;
-		const { dc, dr } = moveDelta;
-		const [c0, r0] = moveStartHexId.split(',').map(Number);
-		return new Set(moveStartIds.map((id) => translateHexId(id, c0, r0, dc, dr, flatTop)));
+		if (!moveActive || (moveDelta.dq === 0 && moveDelta.dr === 0)) return null;
+		const { dq, dr } = moveDelta;
+		return new Set(moveStartIds.map((id) => {
+			const [q, r] = id.split(',').map(Number);
+			return `${q + dq},${r + dr}`;
+		}));
 	});
 
 	// --- library ---
@@ -277,10 +275,57 @@
 		persist();
 	}
 
+	/**
+	 * Migrate a library item from old offset-coordinate format to axial (q, r).
+	 * Detects the old format by checking for `column` in the first position object.
+	 * @param {any} item
+	 * @returns {LibraryItem}
+	 */
+	function migrateItem(item) {
+		if (!item.positions || item.positions.length === 0 || 'q' in item.positions[0]) {
+			return /** @type {LibraryItem} */ (item);
+		}
+		const isFlatTop = item.angle !== 30;
+		/** @param {string} id @returns {string} */
+		function convertId(id) {
+			const [c, r] = id.split(',').map(Number);
+			if (isFlatTop) {
+				const q = 2 * c + (Math.abs(r % 2) === 1 ? 1 : 0);
+				return `${q},${(r - q) / 2}`;
+			} else {
+				const rax = 2 * r + (Math.abs(c % 2) === 1 ? 1 : 0);
+				return `${(c - rax) / 2},${rax}`;
+			}
+		}
+		/** @param {string} id @returns {{q: number, r: number}} */
+		function toPos(id) {
+			const [q, r] = convertId(id).split(',').map(Number);
+			return { q, r };
+		}
+		const newIds = item.ids.map(convertId);
+		const newPositions = newIds
+			.map((/** @type {string} */ id) => { const [q, r] = id.split(',').map(Number); return { q, r }; })
+			.sort((/** @type {{q:number,r:number}} */ a, /** @type {{q:number,r:number}} */ b) => a.r !== b.r ? a.r - b.r : a.q - b.q);
+		const newClusters = item.clusters?.map((/** @type {any} */ cluster) => {
+			const cIds = cluster.ids.map(convertId);
+			return {
+				ids: cIds,
+				positions: cIds
+					.map((/** @type {string} */ id) => { const [q, r] = id.split(',').map(Number); return { q, r }; })
+					.sort((/** @type {{q:number,r:number}} */ a, /** @type {{q:number,r:number}} */ b) => a.r !== b.r ? a.r - b.r : a.q - b.q)
+			};
+		});
+		return { ...item, ids: newIds, positions: newPositions, ...(newClusters ? { clusters: newClusters } : {}) };
+	}
+
 	onMount(() => {
 		try {
 			const stored = localStorage.getItem(LIB_KEY);
-			if (stored) library = JSON.parse(stored);
+			if (stored) {
+				const parsed = JSON.parse(stored);
+				library = parsed.map(migrateItem);
+				persist(); // write back migrated data
+			}
 		} catch {
 			// ignore malformed storage
 		}
@@ -294,8 +339,11 @@
 			const storedOrigin = localStorage.getItem(ORIGIN_KEY);
 			if (storedOrigin) {
 				const parsed = JSON.parse(storedOrigin);
-				originCol = parsed.col ?? 0;
-				originRow = parsed.row ?? 0;
+				if ('q' in parsed) {
+					originQ = parsed.q ?? 0;
+					originR = parsed.r ?? 0;
+				}
+				// old format {col, row} is silently dropped; origin resets to (0,0)
 			}
 		} catch {
 			// ignore malformed storage
@@ -307,23 +355,22 @@
 	}
 
 	/**
-	 * Get sorted {column, row} positions for a library item.
-	 * Handles both the new format and old {id,x,y} format gracefully.
+	 * Get sorted {q, r} axial positions for a library item.
 	 * @param {LibraryItem} item
-	 * @returns {{column: number, row: number}[]}
+	 * @returns {{q: number, r: number}[]}
 	 */
 	function getPositions(item) {
-		if (item.positions && item.positions.length > 0 && 'column' in item.positions[0]) {
-			return /** @type {{column: number, row: number}[]} */ (item.positions);
+		if (item.positions && item.positions.length > 0) {
+			return item.positions;
 		}
 		return item.ids
-			.map((id) => { const [c, r] = id.split(',').map(Number); return { column: c, row: r }; })
-			.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column);
+			.map((id) => { const [q, r] = id.split(',').map(Number); return { q, r }; })
+			.sort((a, b) => a.r !== b.r ? a.r - b.r : a.q - b.q);
 	}
 
-	/** @param {{column: number, row: number}} p @returns {string} */
+	/** @param {{q: number, r: number}} p @returns {string} */
 	function fmtPos(p) {
-		return `{ column: ${p.column - originCol}, row: ${p.row - originRow} }`;
+		return `{ q: ${p.q - originQ}, r: ${p.r - originR} }`;
 	}
 
 	/** @param {LibraryItem} item @returns {string} */
@@ -359,54 +406,20 @@
 		else selected.delete(id);
 	}
 
-	/**
-	 * Translate a hex ID by (dc, dr) with stagger-aware correction so the shape
-	 * is pixel-exact regardless of parity.
-	 *
-	 * In the "doubled" offset system each layout has a stagger that flips when the
-	 * anchor axis changes parity:
-	 *   flat-top:   odd rows shift right → moving by odd dr flips the column stagger
-	 *   flat-sides: odd cols shift down  → moving by odd dc flips the row stagger
-	 *
-	 * Correction formula (flat-top example):
-	 *   correction = (stagger(r1) - stagger(r0) + stagger(rs) - stagger(rs+dr)) / 2
-	 * where stagger(r) = |r%2|===1 ? 1 : 0. The sum is always 0 or ±2, so /2 is
-	 * always an integer (0 or ±1).
-	 *
-	 * @param {string} id source hex ID
-	 * @param {number} c0 drag-anchor column
-	 * @param {number} r0 drag-anchor row
-	 * @param {number} dc column delta
-	 * @param {number} dr row delta
-	 * @param {boolean} flatTop
-	 * @returns {string}
-	 */
-	function translateHexId(id, c0, r0, dc, dr, flatTop) {
-		const [cs, rs] = id.split(',').map(Number);
-		const stagger = (/** @type {number} */ n) => Math.abs(n % 2) === 1 ? 1 : 0;
-		if (flatTop) {
-			const correction = (stagger(r0 + dr) - stagger(r0) + stagger(rs) - stagger(rs + dr)) / 2;
-			return `${cs + dc + correction},${rs + dr}`;
-		} else {
-			const correction = (stagger(c0 + dc) - stagger(c0) + stagger(cs) - stagger(cs + dc)) / 2;
-			return `${cs + dc},${rs + dr + correction}`;
-		}
-	}
-
 	function commitMove() {
-		if (!moveActive || !moveStartHexId) return;
-		const { dc, dr } = moveDelta;
-		if (dc !== 0 || dr !== 0) {
-			const [c0, r0] = moveStartHexId.split(',').map(Number);
+		if (!moveActive) return;
+		const { dq, dr } = moveDelta;
+		if (dq !== 0 || dr !== 0) {
 			for (const id of moveStartIds) selected.delete(id);
 			for (const id of moveStartIds) {
-				selected.add(translateHexId(id, c0, r0, dc, dr, flatTop));
+				const [q, r] = id.split(',').map(Number);
+				selected.add(`${q + dq},${r + dr}`);
 			}
 		}
 		moveActive = false;
 		movePointerId = null;
 		moveStartHexId = null;
-		moveDelta = { dc: 0, dr: 0 };
+		moveDelta = { dq: 0, dr: 0 };
 	}
 
 	/**
@@ -419,7 +432,7 @@
 		const queue = [startId];
 		while (queue.length) {
 			const id = /** @type {string} */ (queue.shift());
-			for (const nId of hexNeighborIds(id, flatTop)) {
+			for (const nId of hexNeighborIds(id)) {
 				if (selected.has(nId) && !cluster.has(nId)) {
 					cluster.add(nId);
 					queue.push(nId);
@@ -445,17 +458,17 @@
 			movePointerId = event.pointerId;
 			moveStartHexId = id;
 			moveStartIds = getCluster(id);
-			moveDelta = { dc: 0, dr: 0 };
+			moveDelta = { dq: 0, dr: 0 };
 			return;
 		}
 
 		// Ctrl+click: move the coordinate origin to this hex
 		if (event.ctrlKey) {
 			event.preventDefault();
-			const [c, r] = id.split(',').map(Number);
-			originCol = c;
-			originRow = r;
-			if (browser) localStorage.setItem(ORIGIN_KEY, JSON.stringify({ col: c, row: r }));
+			const [q, r] = id.split(',').map(Number);
+			originQ = q;
+			originR = r;
+			if (browser) localStorage.setItem(ORIGIN_KEY, JSON.stringify({ q, r }));
 			return;
 		}
 
@@ -506,9 +519,9 @@
 			if (target instanceof Element) {
 				const hex = target.closest('.hex');
 				if (hex instanceof SVGElement && hex.dataset.id && moveStartHexId) {
-					const [c0, r0] = moveStartHexId.split(',').map(Number);
-					const [c1, r1] = hex.dataset.id.split(',').map(Number);
-					moveDelta = { dc: c1 - c0, dr: r1 - r0 };
+					const [q0, r0] = moveStartHexId.split(',').map(Number);
+					const [q1, r1] = hex.dataset.id.split(',').map(Number);
+					moveDelta = { dq: q1 - q0, dr: r1 - r0 };
 				}
 			}
 			return;
@@ -560,7 +573,7 @@
 			moveActive = false;
 			movePointerId = null;
 			moveStartHexId = null;
-			moveDelta = { dc: 0, dr: 0 };
+			moveDelta = { dq: 0, dr: 0 };
 		}
 	}
 
@@ -587,13 +600,13 @@
 		if (!selected.size) return;
 		const ids = [...selected];
 		const positions = ids
-			.map((id) => { const [c, r] = id.split(',').map(Number); return { column: c, row: r }; })
-			.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column);
+			.map((id) => { const [q, r] = id.split(',').map(Number); return { q, r }; })
+			.sort((a, b) => a.r !== b.r ? a.r - b.r : a.q - b.q);
 		const clusterData = selectionClusters.map((cluster) => ({
 			ids: cluster.hexes.map((h) => h.id),
 			positions: cluster.hexes
-				.map((h) => { const [c, r] = h.id.split(',').map(Number); return { column: c, row: r }; })
-				.sort((a, b) => a.row !== b.row ? a.row - b.row : a.column - b.column)
+				.map((h) => { const [q, r] = h.id.split(',').map(Number); return { q, r }; })
+				.sort((a, b) => a.r !== b.r ? a.r - b.r : a.q - b.q)
 		}));
 		const item = {
 			key: crypto.randomUUID(),
@@ -740,9 +753,9 @@
 		<p class="hint">
 			Click or drag to paint. Start on a selected hex to erase.
 			<kbd>Alt</kbd>+click a selected hex to remove its connected cluster.
-			<kbd>Ctrl</kbd>+click any hex to set the coordinate origin.
+			<kbd>Ctrl</kbd>+click any hex to set the origin (coordinates shown as axial q, r).
 			Hold <kbd>Space</kbd> and drag to pan.
-			Hold <kbd>M</kbd> and drag a selected hex to move the whole selection.
+			Hold <kbd>M</kbd> and drag a selected hex to move its cluster.
 		</p>
 
 		<label class="control">
@@ -984,7 +997,7 @@
 						<polygon
 							class="hex"
 							class:selected={selected.has(hex.id)}
-							class:origin={hex.id === `${originCol},${originRow}`}
+							class:origin={hex.id === `${originQ},${originR}`}
 							data-id={hex.id}
 							points={pointsString(hex.points)}
 							style={ci != null ? `fill:${CLUSTER_FILLS[ci % CLUSTER_FILLS.length]}` : ''}

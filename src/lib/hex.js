@@ -1,13 +1,21 @@
 // Hex grid geometry + selection-outline computation.
 //
-// Both flat-top and flat-sides (pointy-top) layouts are supported natively.
-// The orientation is passed as a `flatTop` boolean so the generated (column, row)
-// coordinates always match the visual layout — no SVG rotation needed.
+// Hexes are identified by their axial coordinates (q, r) as the string "${q},${r}".
+// The same (q, r) pair represents the same hex regardless of flat-top or flat-sides
+// orientation — only the pixel projection differs, so shapes transfer cleanly between
+// the two layouts.
+//
+// Axial pixel projections (size = circumradius):
+//   flat-top:   x = size·(3/2·q)                  y = size·(√3/2·q + √3·r)
+//   flat-sides: x = size·(√3·q + √3/2·r)           y = size·(3/2·r)
+//
+// Neighbor offsets are the same six axial vectors in both orientations:
+//   (+1,0) (−1,0) (0,+1) (0,−1) (+1,−1) (−1,+1)
 
 const SQRT3 = Math.sqrt(3);
 
 // Quantization factor for snapping vertices to a shared key.
-const Q = 1000;
+const Q_SNAP = 1000;
 
 /**
  * @typedef {[number, number]} Point
@@ -17,7 +25,7 @@ const Q = 1000;
 
 /** @param {Point} p */
 function vkey(p) {
-	return `${Math.round(p[0] * Q)},${Math.round(p[1] * Q)}`;
+	return `${Math.round(p[0] * Q_SNAP)},${Math.round(p[1] * Q_SNAP)}`;
 }
 
 /**
@@ -42,14 +50,14 @@ function hexCorners(cx, cy, size, pointyTop = false) {
 
 /**
  * Generate a hex grid that fully covers a {width} × {height} viewport.
+ * Hex IDs are axial coordinates: "${q},${r}".
  *
- * Flat-top layout  (flatTop = true, default):
- *   colStep = 3·size,  rowStep = √3·size/2,  odd rows shift right ½ column.
+ * Internally the grid is still generated via the same offset layout loops so
+ * the bounding-box culling is unchanged; we just derive the axial ID from the
+ * offset counters instead of using them directly as IDs.
  *
- * Flat-sides / pointy-top layout  (flatTop = false):
- *   colStep = √3·size/2,  rowStep = 3·size,  odd columns shift down ½ row.
- *
- * In both cases (column, row) increases rightward / downward on screen.
+ * Flat-top offset → axial:   q = 2·co + (|ro%2|===1 ? 1 : 0),  r = (ro − q) / 2
+ * Flat-sides offset → axial: r = 2·ro + (|co%2|===1 ? 1 : 0),  q = (co − r) / 2
  *
  * @param {number} width
  * @param {number} height
@@ -62,38 +70,39 @@ export function generateGrid(width, height, size, flatTop = true) {
 
 	const cx = width / 2;
 	const cy = height / 2;
-	// Half-extent to cover so no gap appears at any pan offset.
 	const R = Math.sqrt(width * width + height * height) / 2 + size * 2;
 
 	/** @type {Hex[]} */
 	const hexes = [];
 
 	if (flatTop) {
-		// colStep = 3·size, rowStep = √3·size/2; odd rows shift right by colStep/2.
 		const colStep = 3 * size;
 		const rowStep = SQRT3 * size / 2;
 		const cHalf = Math.ceil(Math.ceil((2 * R) / colStep + 2) / 2);
 		const rHalf = Math.ceil(Math.ceil((2 * R) / rowStep + 2) / 2);
-		for (let r = -rHalf; r <= rHalf; r++) {
-			for (let c = -cHalf; c <= cHalf; c++) {
-				const hx = cx + c * colStep + (Math.abs(r % 2) === 1 ? colStep / 2 : 0);
-				const hy = cy + r * rowStep;
+		for (let ro = -rHalf; ro <= rHalf; ro++) {
+			for (let co = -cHalf; co <= cHalf; co++) {
+				const hx = cx + co * colStep + (Math.abs(ro % 2) === 1 ? colStep / 2 : 0);
+				const hy = cy + ro * rowStep;
 				if (Math.abs(hx - cx) > R || Math.abs(hy - cy) > R) continue;
-				hexes.push({ id: `${c},${r}`, cx: hx, cy: hy, points: hexCorners(hx, hy, size, false) });
+				const q = 2 * co + (Math.abs(ro % 2) === 1 ? 1 : 0);
+				const r = (ro - q) / 2;
+				hexes.push({ id: `${q},${r}`, cx: hx, cy: hy, points: hexCorners(hx, hy, size, false) });
 			}
 		}
 	} else {
-		// colStep = √3·size/2, rowStep = 3·size; odd columns shift down by rowStep/2.
 		const colStep = SQRT3 * size / 2;
 		const rowStep = 3 * size;
 		const cHalf = Math.ceil(Math.ceil((2 * R) / colStep + 2) / 2);
 		const rHalf = Math.ceil(Math.ceil((2 * R) / rowStep + 2) / 2);
-		for (let c = -cHalf; c <= cHalf; c++) {
-			for (let r = -rHalf; r <= rHalf; r++) {
-				const hx = cx + c * colStep;
-				const hy = cy + r * rowStep + (Math.abs(c % 2) === 1 ? rowStep / 2 : 0);
+		for (let co = -cHalf; co <= cHalf; co++) {
+			for (let ro = -rHalf; ro <= rHalf; ro++) {
+				const hx = cx + co * colStep;
+				const hy = cy + ro * rowStep + (Math.abs(co % 2) === 1 ? rowStep / 2 : 0);
 				if (Math.abs(hx - cx) > R || Math.abs(hy - cy) > R) continue;
-				hexes.push({ id: `${c},${r}`, cx: hx, cy: hy, points: hexCorners(hx, hy, size, true) });
+				const r = 2 * ro + (Math.abs(co % 2) === 1 ? 1 : 0);
+				const q = (co - r) / 2;
+				hexes.push({ id: `${q},${r}`, cx: hx, cy: hy, points: hexCorners(hx, hy, size, true) });
 			}
 		}
 	}
@@ -102,90 +111,44 @@ export function generateGrid(width, height, size, flatTop = true) {
 }
 
 /**
- * Rebuild hex geometry from a list of saved ids.
+ * Rebuild hex geometry from a list of axial-coordinate IDs ("${q},${r}").
  * Centers are laid out about the origin — callers crop to bounding box.
  *
- * @param {string[]} ids
+ * @param {string[]} ids  axial "${q},${r}" IDs
  * @param {number} size
  * @param {boolean} [flatTop]
  * @returns {Hex[]}
  */
 export function buildHexesFromIds(ids, size, flatTop = true) {
-	if (flatTop) {
-		const colStep = 3 * size;
-		const rowStep = SQRT3 * size / 2;
-		return ids.map((id) => {
-			const [c, r] = id.split(',').map(Number);
-			const cx = c * colStep + (Math.abs(r % 2) === 1 ? colStep / 2 : 0);
-			const cy = r * rowStep;
-			return { id, points: hexCorners(cx, cy, size, false) };
-		});
-	} else {
-		const colStep = SQRT3 * size / 2;
-		const rowStep = 3 * size;
-		return ids.map((id) => {
-			const [c, r] = id.split(',').map(Number);
-			const cx = c * colStep;
-			const cy = r * rowStep + (Math.abs(c % 2) === 1 ? rowStep / 2 : 0);
-			return { id, points: hexCorners(cx, cy, size, true) };
-		});
-	}
+	return ids.map((id) => {
+		const [q, r] = id.split(',').map(Number);
+		let hx, hy;
+		if (flatTop) {
+			hx = size * (3 / 2) * q;
+			hy = size * (SQRT3 / 2 * q + SQRT3 * r);
+		} else {
+			hx = size * (SQRT3 * q + SQRT3 / 2 * r);
+			hy = size * (3 / 2) * r;
+		}
+		return { id, points: hexCorners(hx, hy, size, !flatTop) };
+	});
 }
 
 /**
  * Return the IDs of the 6 grid neighbors of a hex.
+ * In axial coordinates the six neighbor offsets are the same regardless of
+ * flat-top or flat-sides orientation, so no layout parameter is needed.
  *
- * In our coordinate system the flat top/bottom (or left/right) shared edges
- * connect cells that are 2 coordinate steps apart on the stagger axis, while
- * the four diagonal shared edges connect cells 1 step apart on that axis.
- *
- * Flat-top (odd rows shift right, colStep=3·size, rowStep=√3·size/2):
- *   even row: top/bottom at r±2 (same col); diagonals at r±1 (col and col-1)
- *   odd  row: top/bottom at r±2 (same col); diagonals at r±1 (col+1 and col)
- *
- * Flat-sides (odd cols shift down, colStep=√3·size/2, rowStep=3·size):
- *   even col: left/right at c±2 (same row); diagonals at c±1 (row and row-1)
- *   odd  col: left/right at c±2 (same row); diagonals at c±1 (row and row+1)
- *
- * @param {string} id
- * @param {boolean} [flatTop]
+ * @param {string} id  axial "${q},${r}" ID
  * @returns {string[]}
  */
-export function hexNeighborIds(id, flatTop = true) {
-	const [c, r] = id.split(',').map(Number);
-	if (flatTop) {
-		if (Math.abs(r % 2) === 1) {
-			// odd row
-			return [
-				`${c},${r - 2}`, `${c},${r + 2}`,
-				`${c + 1},${r - 1}`, `${c + 1},${r + 1}`,
-				`${c},${r - 1}`, `${c},${r + 1}`
-			];
-		} else {
-			// even row
-			return [
-				`${c},${r - 2}`, `${c},${r + 2}`,
-				`${c},${r - 1}`, `${c},${r + 1}`,
-				`${c - 1},${r - 1}`, `${c - 1},${r + 1}`
-			];
-		}
-	} else {
-		if (Math.abs(c % 2) === 1) {
-			// odd column
-			return [
-				`${c - 2},${r}`, `${c + 2},${r}`,
-				`${c + 1},${r}`, `${c + 1},${r + 1}`,
-				`${c - 1},${r}`, `${c - 1},${r + 1}`
-			];
-		} else {
-			// even column
-			return [
-				`${c - 2},${r}`, `${c + 2},${r}`,
-				`${c + 1},${r}`, `${c + 1},${r - 1}`,
-				`${c - 1},${r}`, `${c - 1},${r - 1}`
-			];
-		}
-	}
+export function hexNeighborIds(id) {
+	const [q, r] = id.split(',').map(Number);
+	return [
+		`${q + 1},${r}`, `${q - 1},${r}`,
+		`${q},${r + 1}`, `${q},${r - 1}`,
+		`${q + 1},${r - 1}`, `${q - 1},${r + 1}`
+	];
 }
 
 /**
