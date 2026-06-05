@@ -57,9 +57,41 @@
 	let panStartPanX = 0;
 	let panStartPanY = 0;
 
+	// --- move ---
+	let moveHeld = $state(false);
+	let moveActive = $state(false);
+	/** @type {string | null} */
+	let moveStartHexId = null;
+	/** @type {string[]} */
+	let moveStartIds = [];
+	/** @type {{ dc: number, dr: number }} */
+	let moveDelta = $state({ dc: 0, dr: 0 });
+	/** @type {number | null} */
+	let movePointerId = null;
+
 	// --- viewport (the area the grid fills) ---
 	let stageW = $state(0);
 	let stageH = $state(0);
+
+	// Pan offset that places the origin hex at the viewport centre.
+	const originPanTarget = $derived.by(() => {
+		const SQRT3 = Math.sqrt(3);
+		if (flatTop) {
+			const colStep = 3 * size;
+			const rowStep = (SQRT3 * size) / 2;
+			return {
+				x: -(originCol * colStep + (Math.abs(originRow % 2) === 1 ? colStep / 2 : 0)),
+				y: -(originRow * rowStep),
+			};
+		} else {
+			const colStep = (SQRT3 * size) / 2;
+			const rowStep = 3 * size;
+			return {
+				x: -(originCol * colStep),
+				y: -(originRow * rowStep + (Math.abs(originCol % 2) === 1 ? rowStep / 2 : 0)),
+			};
+		}
+	});
 
 	const grid = $derived(generateGrid(stageW, stageH, size, flatTop));
 	const gridById = $derived(new Map(grid.map((h) => [h.id, h])));
@@ -107,6 +139,13 @@
 	const currentShape = $derived(
 		selectedHexes.length ? buildShape(selectedHexes, outlines, 0) : null
 	);
+
+	const ghostIds = $derived.by(() => {
+		if (!moveActive || (moveDelta.dc === 0 && moveDelta.dr === 0) || !moveStartHexId) return null;
+		const { dc, dr } = moveDelta;
+		const [c0, r0] = moveStartHexId.split(',').map(Number);
+		return new Set(moveStartIds.map((id) => translateHexId(id, c0, r0, dc, dr, flatTop)));
+	});
 
 	// --- library ---
 	/** @type {LibraryItem[]} */
@@ -321,6 +360,56 @@
 	}
 
 	/**
+	 * Translate a hex ID by (dc, dr) with stagger-aware correction so the shape
+	 * is pixel-exact regardless of parity.
+	 *
+	 * In the "doubled" offset system each layout has a stagger that flips when the
+	 * anchor axis changes parity:
+	 *   flat-top:   odd rows shift right → moving by odd dr flips the column stagger
+	 *   flat-sides: odd cols shift down  → moving by odd dc flips the row stagger
+	 *
+	 * Correction formula (flat-top example):
+	 *   correction = (stagger(r1) - stagger(r0) + stagger(rs) - stagger(rs+dr)) / 2
+	 * where stagger(r) = |r%2|===1 ? 1 : 0. The sum is always 0 or ±2, so /2 is
+	 * always an integer (0 or ±1).
+	 *
+	 * @param {string} id source hex ID
+	 * @param {number} c0 drag-anchor column
+	 * @param {number} r0 drag-anchor row
+	 * @param {number} dc column delta
+	 * @param {number} dr row delta
+	 * @param {boolean} flatTop
+	 * @returns {string}
+	 */
+	function translateHexId(id, c0, r0, dc, dr, flatTop) {
+		const [cs, rs] = id.split(',').map(Number);
+		const stagger = (/** @type {number} */ n) => Math.abs(n % 2) === 1 ? 1 : 0;
+		if (flatTop) {
+			const correction = (stagger(r0 + dr) - stagger(r0) + stagger(rs) - stagger(rs + dr)) / 2;
+			return `${cs + dc + correction},${rs + dr}`;
+		} else {
+			const correction = (stagger(c0 + dc) - stagger(c0) + stagger(cs) - stagger(cs + dc)) / 2;
+			return `${cs + dc},${rs + dr + correction}`;
+		}
+	}
+
+	function commitMove() {
+		if (!moveActive || !moveStartHexId) return;
+		const { dc, dr } = moveDelta;
+		if (dc !== 0 || dr !== 0) {
+			const [c0, r0] = moveStartHexId.split(',').map(Number);
+			for (const id of moveStartIds) selected.delete(id);
+			for (const id of moveStartIds) {
+				selected.add(translateHexId(id, c0, r0, dc, dr, flatTop));
+			}
+		}
+		moveActive = false;
+		movePointerId = null;
+		moveStartHexId = null;
+		moveDelta = { dc: 0, dr: 0 };
+	}
+
+	/**
 	 * BFS through the selected set from startId, returning all connected hex IDs.
 	 * @param {string} startId
 	 * @returns {string[]}
@@ -345,6 +434,20 @@
 		if (spaceHeld) return; // let event bubble up so SVG can handle panning
 		if (event.isPrimary === false) return;
 		if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+		// Move mode: drag the cluster under the pointer independently
+		if (moveHeld && selected.has(id)) {
+			event.preventDefault();
+			if (event.currentTarget instanceof Element) {
+				try { event.currentTarget.releasePointerCapture(event.pointerId); } catch {}
+			}
+			moveActive = true;
+			movePointerId = event.pointerId;
+			moveStartHexId = id;
+			moveStartIds = getCluster(id);
+			moveDelta = { dc: 0, dr: 0 };
+			return;
+		}
 
 		// Ctrl+click: move the coordinate origin to this hex
 		if (event.ctrlKey) {
@@ -398,6 +501,18 @@
 			panY = panStartPanY + (event.clientY - panStartY);
 			return;
 		}
+		if (moveActive && event.pointerId === movePointerId) {
+			const target = document.elementFromPoint(event.clientX, event.clientY);
+			if (target instanceof Element) {
+				const hex = target.closest('.hex');
+				if (hex instanceof SVGElement && hex.dataset.id && moveStartHexId) {
+					const [c0, r0] = moveStartHexId.split(',').map(Number);
+					const [c1, r1] = hex.dataset.id.split(',').map(Number);
+					moveDelta = { dc: c1 - c0, dr: r1 - r0 };
+				}
+			}
+			return;
+		}
 		if (!painting || event.pointerId !== paintPointerId) return;
 		const target = document.elementFromPoint(event.clientX, event.clientY);
 		if (!(target instanceof Element)) return;
@@ -419,6 +534,10 @@
 			panActive = false;
 			panPointerId = null;
 		}
+		if (moveActive && event.pointerId === movePointerId) {
+			commitMove();
+			return;
+		}
 		stopPainting(event);
 	}
 
@@ -431,6 +550,18 @@
 			if (painting) stopPainting();
 			event.preventDefault();
 		}
+		if (event.code === 'KeyM' && !event.repeat) {
+			const active = document.activeElement;
+			if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+			moveHeld = true;
+			event.preventDefault();
+		}
+		if (event.code === 'Escape' && moveActive) {
+			moveActive = false;
+			movePointerId = null;
+			moveStartHexId = null;
+			moveDelta = { dc: 0, dr: 0 };
+		}
 	}
 
 	/** @param {KeyboardEvent} event */
@@ -441,6 +572,10 @@
 				panActive = false;
 				panPointerId = null;
 			}
+		}
+		if (event.code === 'KeyM') {
+			moveHeld = false;
+			if (moveActive) commitMove();
 		}
 	}
 
@@ -607,6 +742,7 @@
 			<kbd>Alt</kbd>+click a selected hex to remove its connected cluster.
 			<kbd>Ctrl</kbd>+click any hex to set the coordinate origin.
 			Hold <kbd>Space</kbd> and drag to pan.
+			Hold <kbd>M</kbd> and drag a selected hex to move the whole selection.
 		</p>
 
 		<label class="control">
@@ -817,10 +953,10 @@
 			<div class="status-actions">
 				<button
 					onclick={() => {
-						panX = 0;
-						panY = 0;
+						panX = originPanTarget.x;
+						panY = originPanTarget.y;
 					}}
-					disabled={panX === 0 && panY === 0}>Re-center</button
+					disabled={panX === originPanTarget.x && panY === originPanTarget.y}>Re-center</button
 				>
 				<button onclick={clear} disabled={selected.size === 0}>Clear</button>
 			</div>
@@ -836,6 +972,8 @@
 				role="presentation"
 				class:pan-mode={spaceHeld}
 				class:pan-active={panActive}
+				class:move-mode={moveHeld && !moveActive}
+				class:move-active={moveActive}
 				onpointerdown={handleSvgPointerDown}
 				onpointerleave={stopPainting}
 			>
@@ -874,6 +1012,17 @@
 								stroke-width={size * 0.12}
 								fill={CLUSTER_STROKES[ci % CLUSTER_STROKES.length]}
 							>{ci + 1}</text>
+						{/each}
+					{/if}
+
+					{#if ghostIds}
+						{#each grid as hex (hex.id)}
+							{#if ghostIds.has(hex.id)}
+								<polygon
+									class="hex ghost"
+									points={pointsString(hex.points)}
+								/>
+							{/if}
 						{/each}
 					{/if}
 				</g>
@@ -1398,6 +1547,15 @@
 		cursor: grabbing;
 	}
 
+	svg.move-mode .hex.selected {
+		cursor: move;
+	}
+
+	svg.move-active,
+	svg.move-active .hex {
+		cursor: move;
+	}
+
 	.hex {
 		fill: var(--white);
 		stroke: var(--black-faint);
@@ -1418,6 +1576,14 @@
 		stroke: var(--green);
 		stroke-width: 3;
 		stroke-linejoin: round;
+		pointer-events: none;
+	}
+
+	.hex.ghost {
+		fill: rgba(0, 166, 62, 0.35);
+		stroke: var(--green);
+		stroke-width: 2;
+		stroke-dasharray: 5 3;
 		pointer-events: none;
 	}
 </style>
